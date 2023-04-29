@@ -1,0 +1,14 @@
+# install all requirements using a single command:
+# $ pip install -r requirements.txt
+
+z3-solver
+# python-sat
+
+# lark
+# graphviz
+
+
+# pytictoc
+termcolor
+
+pytest
