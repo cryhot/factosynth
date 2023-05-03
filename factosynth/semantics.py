@@ -22,45 +22,50 @@ class Operator(abc.ABC):
     @abc.abstractmethod
     def operators(self) -> typing.Mapping[str,z3.ExprRef]: raise NotImplementedError
     def __init__(self, operator=None, *, solver=None):
-        if isinstance(operator, str): operator = [operator]
-        if operator is None: operator = list(self.operators.keys())
-        self.choice = Choice(
-            (op, self.operators[op])
-            for op in operator
-        )
+        if not isinstance(operator, Choice):
+            if isinstance(operator, str): operator = [operator]
+            if operator is None: operator = list(self.operators.keys())
+            operator = Choice(
+                (op, self.operators[op])
+                for op in operator
+            )
+        self.choice = operator
         if solver is not None: solver.add(self.valid)
     @classmethod
     def from_json(cls, obj):
         return cls(obj)
-    def to_json(self):
+    def to_json(self) -> str:
         return self.choice.key()
-    def __call__(self, *args, model=None, model_completion=False):
-        eval_kwargs = dict(model=model, model_completion=model_completion)
+    def to_cnide(self) -> str:
+        choices = []
+        for key in self.choice.keys():
+            choices.append(f"{key}")
+        if len(choices) == 1: ans = choices[0]
+        else: ans = f"{{{','.join(choices)}}}"
+        return ans
+    def __call__(self, *args, solver=None):
         args = list(args)
         for i,arg in enumerate(args):
             if not isinstance(arg,z3.ExprRef): args[i] = Int32Sort.cast(arg)
         ans = z3.substitute(
-            self.choice.value(**eval_kwargs),
+            self.choice.value(),
             *(
                 (var, val)
                 for var, val in zip(self.args, args)
             )
         )
         ans = z3.simplify(ans)
+        if solver is not None:
+            ans, out = z3.FreshConst(Int32Sort, prefix=f'ans'), ans # fresh constant
+            solver.add(ans==out)
         return ans
     @property
     def valid(self):
         return self.choice.valid
     def eval(self, model, model_completion=False):
         eval_kwargs = dict(model=model, model_completion=model_completion)
-        # eval_kwargs.update(model_completion=True)
-        # print(self.choice)
-        # print(self.choice.value(**eval_kwargs))
-        # print(model)
-        # print("ValidR:", self.choice.valid)
-        # print("Valid:", model.eval(self.choice.valid))
         return self.__class__(
-            operator=self.choice.key(**eval_kwargs),
+            operator=self.choice.eval(**eval_kwargs),
         )
 class Comparator(Operator):
     args = a,b = z3.Consts('A B', Int32Sort)
@@ -421,11 +426,22 @@ class Register(dict):
 
 
 
+def signal_choice_to_cnide(signal:Choice) -> str:
+    if not isinstance(signal, Choice): signal=Choice(signal)
+    choices = []
+    for value in signal.values():
+        if z3.is_bv_value(value): value = z3.simplify(z3.BV2Int(value, is_signed=True))
+        if z3.is_const(value): value = str(value).replace("SIGNAL:","").replace("SIGNAL?:","")
+        choices.append(f"{value}")
+    if len(choices) == 1: ans = choices[0]
+    else: ans = f"{{{','.join(choices)}}}"
+    return ans
+
 class ControlBehavior(abc.ABC):
     def __init__(self, *, solver=None):
         if solver is not None: solver.add(self.valid)
     @abc.abstractmethod
-    def __call__(self, input:Register, *, model=None, model_completion=False, solver=None):
+    def __call__(self, input:Register, *, solver=None):
         """If a solver is passed, create temporary variables."""
         if solver is not None:
             ans = Register.fromkeys(input) # fresh constants
@@ -505,11 +521,10 @@ class DeciderControlBehavior(ControlBehavior):
             self.comparator.valid,
             self.output_signal.valid,
         )
-    def __call__(self, input:Register, *, model=None, model_completion=False, solver=None):
-        eval_kwargs = dict(model=model, model_completion=model_completion)
-        first_signal = self.first_signal.value(**eval_kwargs)
-        second_signal = self.second_signal.value(**eval_kwargs)
-        output_signal = self.output_signal.value(**eval_kwargs)
+    def __call__(self, input:Register, *, solver=None):
+        first_signal = self.first_signal.value()
+        second_signal = self.second_signal.value()
+        output_signal = self.output_signal.value()
         decision = self.comparator(first_signal, second_signal)
         decision = z3.If(
             is_const(first_signal, SignalConst(EVERYTHING)),
@@ -562,28 +577,26 @@ class DeciderControlBehavior(ControlBehavior):
                 (SignalConst(ANYTHING,False), z3.BoolVal(False)),
             )
         ans = ans.simplify(bv_ite2id=True)
-        return super().__call__(ans, model=model, model_completion=model_completion, solver=solver)
+        return super().__call__(ans, solver=solver)
     def eval(self, model, model_completion=False):
         eval_kwargs = dict(model=model, model_completion=model_completion)
-        return self.__class__(
-            first_signal=model.eval(self.first_signal.value(**eval_kwargs), model_completion=model_completion),
-            comparator=self.comparator.eval(**eval_kwargs),
-            second_signal=model.eval(self.second_signal.value(**eval_kwargs), model_completion=model_completion),
-            output_signal=model.eval(self.output_signal.value(**eval_kwargs), model_completion=model_completion),
-            copy_count_from_input=model.eval(self.copy_count_from_input, model_completion=model_completion),
-        )
+        new_kwargs=dict()
+        new_kwargs.update(first_signal=self.first_signal.eval(**eval_kwargs,eval_value=True))
+        new_kwargs.update(comparator=self.comparator.eval(**eval_kwargs))
+        new_kwargs.update(second_signal=self.second_signal.eval(**eval_kwargs,eval_value=True))
+        new_kwargs.update(output_signal=self.output_signal.eval(**eval_kwargs,eval_value=True))
+        new_kwargs.update(copy_count_from_input=model.eval(self.copy_count_from_input, model_completion=model_completion))
+        return self.__class__(**new_kwargs)
 
-    def to_cnide(self):
+    def to_cnide(self) -> str:
         """See also: https://github.com/charredUtensil/cnide"""
-        first_value = self.first_signal.value()
-        if z3.is_bv_value(first_value): first_value = z3.simplify(z3.BV2Int(first_value, is_signed=True))
-        if z3.is_const(first_value): first_value = str(first_value).replace("SIGNAL:","")
-        second_value = self.second_signal.value()
-        if z3.is_bv_value(second_value): second_value = z3.simplify(z3.BV2Int(second_value, is_signed=True))
-        if z3.is_const(second_value): second_value = str(second_value).replace("SIGNAL:","")
-        output_value = self.output_signal.value()
-        if z3.is_const(output_value): output_value = str(output_value).replace("SIGNAL?:","")
-        ans = f"""{first_value} {self.comparator.to_json()} {second_value} then {"" if self.copy_count_from_input else "1 as "}{output_value}"""
+        first_signal = signal_choice_to_cnide(self.first_signal)
+        comparator = self.comparator.to_cnide()
+        second_signal = signal_choice_to_cnide(self.second_signal)
+        output_signal = signal_choice_to_cnide(self.output_signal)
+        try: output_count = "" if self.copy_count_from_input else "1 as "
+        except z3.Z3Exception: output_count = "1? as "
+        ans = f"""{first_signal} {comparator} {second_signal} then {output_count}{output_signal}"""
         return ans
 
 class ArithmeticControlBehavior(ControlBehavior):
@@ -645,11 +658,10 @@ class ArithmeticControlBehavior(ControlBehavior):
             self.operation.valid,
             self.output_signal.valid,
         )
-    def __call__(self, input:Register, *, model=None, model_completion=False, solver=None):
-        eval_kwargs = dict(model=model, model_completion=model_completion)
-        first_signal = self.first_signal.value(**eval_kwargs)
-        second_signal = self.second_signal.value(**eval_kwargs)
-        output_signal = self.output_signal.value(**eval_kwargs)
+    def __call__(self, input:Register, *, solver=None):
+        first_signal = self.first_signal.value()
+        second_signal = self.second_signal.value()
+        output_signal = self.output_signal.value()
         output_count = self.operation(first_signal, second_signal)
         output_count = input[output_count]
         output_count = z3.simplify(output_count, bv_ite2id=True)
@@ -677,27 +689,23 @@ class ArithmeticControlBehavior(ControlBehavior):
                 ),
             )
         ans = ans.simplify(bv_ite2id=True)
-        return super().__call__(ans, model=model, model_completion=model_completion, solver=solver)
+        return super().__call__(ans, solver=solver)
     def eval(self, model, model_completion=False):
         eval_kwargs = dict(model=model, model_completion=model_completion)
-        return self.__class__(
-            first_signal=model.eval(self.first_signal.value(**eval_kwargs), model_completion=model_completion),
-            operation=self.operation.eval(**eval_kwargs),
-            second_signal=model.eval(self.second_signal.value(**eval_kwargs), model_completion=model_completion),
-            output_signal=model.eval(self.output_signal.value(**eval_kwargs), model_completion=model_completion),
-        )
+        new_kwargs=dict()
+        new_kwargs.update(first_signal=self.first_signal.eval(**eval_kwargs,eval_value=True))
+        new_kwargs.update(operation=self.operation.eval(**eval_kwargs))
+        new_kwargs.update(second_signal=self.second_signal.eval(**eval_kwargs,eval_value=True))
+        new_kwargs.update(output_signal=self.output_signal.eval(**eval_kwargs,eval_value=True))
+        return self.__class__(**new_kwargs)
 
-    def to_cnide(self):
+    def to_cnide(self) -> str:
         """See also: https://github.com/charredUtensil/cnide"""
-        first_value = self.first_signal.value()
-        if z3.is_bv_value(first_value): first_value = z3.simplify(z3.BV2Int(first_value, is_signed=True))
-        if z3.is_const(first_value): first_value = str(first_value).replace("SIGNAL:","")
-        second_value = self.second_signal.value()
-        if z3.is_bv_value(second_value): second_value = z3.simplify(z3.BV2Int(second_value, is_signed=True))
-        if z3.is_const(second_value): second_value = str(second_value).replace("SIGNAL:","")
-        output_value = self.output_signal.value()
-        if z3.is_const(output_value): output_value = str(output_value).replace("SIGNAL?:","")
-        ans = f"""{first_value} {self.operation.to_json()} {second_value} as {output_value}"""
+        first_signal = signal_choice_to_cnide(self.first_signal)
+        operation = self.operation.to_cnide()
+        second_signal = signal_choice_to_cnide(self.second_signal)
+        output_signal = signal_choice_to_cnide(self.output_signal)
+        ans = f"""{first_signal} {operation} {second_signal} as {output_signal}"""
         return ans
 
 
